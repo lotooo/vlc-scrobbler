@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
-#import urllib2
 import logging
 import ConfigParser
 from vlcrc import VLCRemote
@@ -12,20 +11,17 @@ import time
 import re
 import os
 import getopt
-from tvrage import api
-from tvrage import feeds
+from xbmc import XbmcClient
 
 VERSION = "0.1"
 VLC_VERSION = VLC_DATE = ""
-TIMER_INTERVAL = 10
+TIMER_INTERVAL = 120
 
 class TraktForVLC(object):
 
-  def __init__(self, datadir, configfile):
-    logfile = datadir + "/TraktForVLC.log"
-        
+  def __init__(self, datadir, configfile, logfile):
     logging.basicConfig(format="%(asctime)s::%(name)s::%(levelname)s::%(message)s",
-                            level=logging.DEBUG,
+                            level=logging.INFO,
                             filename=logfile,
                             stream=sys.stdout)
 
@@ -49,36 +45,56 @@ class TraktForVLC(object):
     self.trakt_client = TraktClient.TraktClient(trakt_api,
                                                 trakt_username,
                                                 trakt_password)
+    self.trakt_buffer = self.config.get("TraktForVLC", "bufferfile")
+
+    self.xbmc_host = self.config.get("XBMC", "host")	
+    self.xbmc_user = self.config.get("XBMC", "username")
+    self.xbmc_pass = self.config.get("XBMC", "password")
+    self.xbmc_db = self.config.get("XBMC", "db")
+    self.xbmc_buffer = self.config.get("XBMC", "bufferfile")
+    self.last_xbmc_status = ""
+    #self.xbmc_client = XbmcClient(self.xbmc_host,self.xbmc_user,self.xbmc_pass,self.xbmc_db)
 
     self.scrobbled = False
+    self.watching = False
     self.watching_now = ""
     self.timer = 0
 
   def run(self):
-    #while (True):
-    #  self.timer += TIMER_INTERVAL
-    #  try:
-    #      self.main()
-    #  except Exception, e:
-    #      self.log.warning("An unknown error occurred.")
-    #  time.sleep(TIMER_INTERVAL)
-    self.main()
+    while (True):
+      self.timer += TIMER_INTERVAL
+      try:
+          self.main()
+      except Exception, e:
+          self.log.warning("An unknown error occurred.")
+      time.sleep(TIMER_INTERVAL)
     
   def main(self):
-    #--extraintf=rc --rc-host=127.0.0.1:4222 --rc-quiet
     try:
       vlc = VLCRemote(self.vlc_ip, self.vlc_port)
     except:
       self.log.debug('Could not find VLC running at ' + str(self.vlc_ip) + ':'+ str(self.vlc_port))
+      self.scrobbled = False
+      self.watching = False
       return
+
+    # Try to connect to xbmc
+    self.xbmc_client = XbmcClient(self.xbmc_host,self.xbmc_user,self.xbmc_pass,self.xbmc_db,self.xbmc_buffer)
+    if self.last_xbmc_status is not self.xbmc_client.is_alive:
+	if self.xbmc_client.is_alive is True:
+		self.log.info("XBMC is reacheable") 
+	else:
+		self.log.info("XBMC is unreacheable. Disabling it.") 
+    self.last_xbmc_status = self.xbmc_client.is_alive
+		
       
     vlcStatus = vlc.get_status()
     if vlcStatus:
       video = self.get_TV(vlc)
-      self.log.debug(video)
       if video is None:
         video = self.get_Movie(vlc)
-        self.log.debug(video)
+	if video is None:
+		return
 
       if (video["percentage"] >= 90
           and not self.scrobbled):
@@ -102,10 +118,15 @@ class TraktForVLC(object):
                   if ("scrobbled" in e.msg and "already" in e.msg):
                       self.log.info("Seems we've already scrobbled this episode recently, aborting scrobble attempt.")
                       self.scrobbled = True
+              try:
+              	self.xbmc_client.mark_as_seen(video["idFile"])
+              except:
+              	self.log.error("An error occurred while trying to mark as seen in xbmc")
               
       elif (video["percentage"] < 90
             and not self.scrobbled
-            and self.timer >= 900):
+            and not self.watching
+            and self.timer >= 300):
           self.log.info("Watching on Trakt")
           self.timer = 0
       
@@ -120,6 +141,7 @@ class TraktForVLC(object):
                                                     tv=video["tv"],
                                                     season=video["season"],
                                                     episode=video["episode"])
+              self.watching = True
               
           except TraktClient.TraktError, (e):
               self.timer = 870
@@ -130,74 +152,61 @@ class TraktForVLC(object):
   def get_TV(self, vlc):
     try:
       now_playing = vlc.get_title("^(?!status change:)(?P<SeriesName>.+?)(?:[[(]?(?P<Year>[0-9]{4})[])]?.*)? *S?(?P<SeasonNumber>[0-9]+)(?:[ .XE]?(?P<EpisodeNumber>[0-9]{1,3})).*\.[a-z]{2,4}")
-      seriesName = now_playing.group('SeriesName').rstrip(' -').replace('.', ' ')
-      seriesYear = ifnull(now_playing.group('Year'),'1900')
-      seasonNumber = ifnull(now_playing.group('SeasonNumber').lstrip('0'),'0')
-      episodeNumber = ifnull(now_playing.group('EpisodeNumber').lstrip('0'),'0')
-      
-      if self.valid_TV(seriesName):
-        series = api.Show(seriesName)
-        
-        duration = int(vlc.get_length())
+      fn = now_playing.group(0)    
+      filename = fn.lstrip('> ')
+      self.log.debug('Playing: %s'%filename)
+      if self.xbmc_client.is_alive:
+      	tv_show = self.xbmc_client.get_tv_show_info(filename)
+      else:
+	self.xbmc_client.add_2_buffer(filename)
+
+      if tv_show:
+      	self.log.debug('SeriesName: %s'%tv_show['seriesName'])
+      	duration = int(vlc.get_length())
         time = int(vlc.get_time())
         percentage = time*100/duration
-        try:
-          episode = series.season(int(seasonNumber)).episode(int(episodeNumber))
-          return self.set_video(True, seriesName, series.started, duration, percentage, seasonNumber, episodeNumber)
-        except:
-          self.log.debug("Episode -> no valid episode found")
-          return  
+        return self.set_video(True, 
+        	tv_show['seriesName'], 
+        	tv_show['seriesYear'], 
+        	duration, 
+        	percentage, 
+        	tv_show['seasonNumber'], 
+        	tv_show['episodeNumber'], 
+        	tv_show['idFile'])             	
+      elif self.xbmc_client.is_alive:
+      	self.log.debug('No matching TV Show file in XBMC')
     except:
-      self.log.debug("No matching tv show found for video playing")
-      return 
-
-  def valid_TV(self, seriesName):
-    try:
-      series = feeds.full_search(seriesName)
-      if (len(series) == 0):
-        self.log.debug("Get_Title -> No Series found by file name.")
-        return False
-      return True
-    except:
-      self.log.debug("Valid_TV -> no valid title found.")
-      return False
+    	return 
 
   def get_Movie(self, vlc):
     try:
       now_playing = vlc.get_title("^(?!status change:)(?P<Title>.+?) ?(?:[[(]?(?P<Year>[0-9]{4})[])]?.*)? *\.[a-z]{2,4}")
-      title = now_playing.group('Title') + ' ' + ifnull(now_playing.group('Year'), '')
-      duration = int(vlc.get_length())
-      playtime = int(vlc.get_time())
-      percentage = playtime*100/duration
-      if self.valid_Movie(title, duration):
-        movie = movie_info.get_movie_info(vlcTitle)
-        year = movie['Year']
-        return set_video(False, title, year, duration, percentage, -1, -1)
-      return 
+      fn = now_playing.group(0)    
+      filename = fn.lstrip('> ')
+      self.log.debug('Playing: %s'%filename)
+      if self.xbmc_client.is_alive:
+      	movie = self.xbmc_client.get_movie_info(filename)
+      else:
+	self.xbmc_client.add_2_buffer(filename)
+      
+      if movie:
+      	duration = int(vlc.get_length())
+      	playtime = int(vlc.get_time())
+      	percentage = playtime*100/duration
+      	return self.set_video(False, 
+      			movie['title'], 
+      			movie['year'], 
+      			duration, 
+      			percentage, -1, -1, movie['idFile'])
+      elif self.xbmc_client.is_alive:
+      	self.log.debug("No matching movie found for video playing in XBMC")
+      	
     except:
       self.log.debug("No matching movie found for video playing")
       return 
       
-
-  def valid_Movie(self, vlcTitle, vlcDuration):
-    try:
-      # Get Movie info
-      movie = movie_info.get_movie_info(vlcTitle)
-      # Compare Movie runtime against VLC runtime
-      regex = re.compile('^((?P<hour>[0-9]{1,2}).*?h)?.*?(?P<min>[0-9]{1,2}).*?min?',re.IGNORECASE|re.MULTILINE)
-      r = regex.search(movie['Runtime'])
-      try:
-        time = int(r.group('hour'))*60*60+int(r.group('min'))*60
-      except:
-        return False
-      if (vlcDuration == time - 300) or (vlcDuration == time + 300):
-        return True
-    except:
-      self.log.debug("Valid_Movie -> no valid title found")
-      return False
-    return False
-      
-  def set_video(self, tv, title, year, duration, percentage, season, episode):
+     
+  def set_video(self, tv, title, year, duration, percentage, season, episode,idFile):
     video = {}
     video["tv"] = tv
     video["title"] = title 
@@ -206,6 +215,7 @@ class TraktForVLC(object):
     video["percentage"] = percentage
     video["season"] = season
     video["episode"] = episode
+    video["idFile"] = idFile
     return video
 
 def ifnull(var, val):
@@ -263,7 +273,7 @@ if __name__ == '__main__':
   config = ""
   
   try:
-    opts, args = getopt.getopt(sys.argv[1:], "dp", ['daemon', 'pidfile=', 'datadir=', 'config=']) #@UnusedVariable
+    opts, args = getopt.getopt(sys.argv[1:], "dp", ['daemon', 'pidfile=', 'datadir=', 'config=', 'log=']) #@UnusedVariable
   except getopt.GetoptError:
     print "Available options: --daemon, --pidfile, --datadir, --config"
     sys.exit()
@@ -287,6 +297,9 @@ if __name__ == '__main__':
     # Determine location of config file
     if o in ('--config',):
       config = str(a)
+      
+    if o in ('--log',):
+      logfile = str(a)      
 
   if should_daemon:
     daemonize(pidfile)
@@ -297,7 +310,7 @@ if __name__ == '__main__':
     config = sys.path[0]
   configfile = config + "/config.ini"
 
-  client = TraktForVLC(datadir, configfile)
+  client = TraktForVLC(datadir, configfile, logfile)
   client.run()
 
   

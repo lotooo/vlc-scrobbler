@@ -63,10 +63,13 @@ class VLCRemote(object):
         return match
 
     def get_filename(self):
-        fn_re = re.compile('input: file://(?P<fn>.+?) \)',re.MULTILINE)
+        fn_re = re.compile('new input: file://(?P<fn>.+?) \)',re.MULTILINE)
         match = self._command('status', fn_re)
         fn = match.groupdict()['fn']
         fn = fn.replace('%20',' ')
+        #fn_re = re.compile('(?P<title>.+)')
+        #fn = self._command('get_title',fn_re)
+        #fn = fn.groupdict()['title']
         return fn
 
     def restart(self):
@@ -88,9 +91,11 @@ class VLCRemote(object):
       return title
 
     def is_playing(self):
-      fn_re = re.compile('(?P<playing>.+)')
+      #fn_re = re.compile('(?P<playing>.+)')
+      fn_re = re.compile('(?P<playing>\d+)')
       playing = self._command('is_playing', fn_re, raw=True)
       playing = playing.groupdict()['playing']
+      #playing = playing.group(1)
       return playing
 
     def get_info(self):
@@ -100,9 +105,7 @@ class VLCRemote(object):
       return info
 
     def get_status(self):
-      fn_re = re.compile('(?P<status>.+)')
-      status = self._command('status')
-      #status = status.groupdict()['status']
+      status = self.is_playing()
       return status
 
     def get_length(self):
